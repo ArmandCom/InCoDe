@@ -101,7 +101,7 @@ def parse_args():
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default=None,
+        default="CompVis/stable-diffusion-v1-4",
         required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.  ie: CompVis/stable-diffusion-v1-4",
     )
@@ -891,8 +891,6 @@ def main():
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
-    epochs_loss = {}
-
 
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
