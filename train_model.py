@@ -10,28 +10,16 @@
 # Unless required by applicable law or agreed to in writing, softwareq
 # distributed under the Licensem is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and                #sampled_probs = mask_sampler.sample((bsz,)) #For now, uniform sampling is fine
-#                 sampled_probs = torch.rand((bsz,))
-#                 random_mask = torch.rand((bsz, curriculum)) < sampled_probs.view(-1,1)
-#
-#                 encoder_attention_mask[:, 1:curriculum+1] = encoder_attention_mask[:, 1:curriculum+1] & random_mask.to(
-#                     accelerator.device)
-#
-#                 where_null_mask = vector_nulls == 0
-#                 encoder_attention_mask[where_null_mask, 0:curriculum+1] = True #Vigilar amb aixo, probarho al reves tambe
+# See the License for the specific language governing permissions and
 # limitations under the License.
 """Fine-tuning script for Stable Diffusion for text2imagce with support for LoRA."""
 import os
 
-#os.environ["CUDA_AVAILABLE_DEVICES"] = "1"
 import argparse
-import itertools
 import logging
 import math
 import random
-import shutil
 from pathlib import Path
-# from arch.bedroom import QuerierBedroom
 import wandb
 
 import numpy as np
@@ -54,8 +42,7 @@ from diffusers.loaders import AttnProcsLayers
 from diffusers.models.attention_processor import LoRAAttnProcessor
 from diffusers.optimization import get_scheduler
 
-from diffusers.utils import check_min_version, is_wandb_available
-from huggingface_hub import create_repo, upload_folder
+from huggingface_hub import create_repo
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
 
@@ -116,6 +103,7 @@ def parse_args():
         "--dataset_name",
         type=str,
         default=None,
+        required=True,
         help=(
             "The name of the Dataset (from the HuggingFace hub) to train on (could be your own, possibly private,"
             " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
@@ -123,31 +111,15 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--dataset_config_name",
-        type=str,
-        default=None,
-        help="The config of the Dataset, leave as None if there's only one config.",
-    )
-    parser.add_argument(
         "--null_cond_prob",
         type=float,
         default=0.1,
     )
     parser.add_argument(
-        "--train_data_dir",
-        type=str,
-        default=None,
-        help=(
-            "A folder containing the training data. Folder contents must follow the structure described in"
-            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
-            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
-        ),
-    )
-    parser.add_argument(
         "--image_column", type=str, default="image", help="The column of the dataset containing an image."
     )
     parser.add_argument(
-        "--caption_column",
+        "--attributes_column",
         type=str,
         default="answers",
         help="The column of the dataset containing a caption or a list of captions.",
@@ -283,13 +255,6 @@ def parse_args():
         "--lr_warmup_steps", type=int, default=2000, help="Number of steps for the warmup in the lr scheduler."  # 4190
     )
     parser.add_argument(
-        "--snr_gamma",
-        type=float,
-        default=None,
-        help="SNR weighting gamma to be used if rebalancing the loss. Recommended value is 5.0. "
-             "More details here: https://arxiv.org/abs/2303.09556.",
-    )
-    parser.add_argument(
         "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes."
     )
     parser.add_argument(
@@ -313,8 +278,6 @@ def parse_args():
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
     parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
-    parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
-    parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
     parser.add_argument(
         "--prediction_type",
         type=str,
@@ -351,7 +314,7 @@ def parse_args():
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=7284*2,
+        default=10000,
         help=(
             "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
             " training using `--resume_from_checkpoint`."
@@ -365,9 +328,6 @@ def parse_args():
             "Whether training should be resumed from a previous checkpoint. Use a path saved by"
             ' `--checkpointing_steps`, or `"latest"` to automatically select the last available checkpoint.'
         ),
-    )
-    parser.add_argument(
-        "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
     )
     parser.add_argument("--noise_offset", type=float, default=0, help="The scale of noise offset.")
     parser.add_argument(
@@ -389,17 +349,17 @@ def parse_args():
     parser.add_argument(
         "--num_queries",
         type=int,
-        default=58,
+        default=None,
+        help=(
+        "The number of attributes that our model will trained with. If no value, it will be defaulted with the"
+        ' first dataset member'
+        )
     )
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
-
-    # Sanity checks
-    if args.dataset_name is None and args.train_data_dir is None:
-        raise ValueError("Need either a dataset name or a training folder.")
 
     return args
 
@@ -468,10 +428,6 @@ def main():
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
-        if args.push_to_hub:
-            repo_id = create_repo(
-                repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
-            ).repo_id
 
     # Load scheduler, tokenizer and models.
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
@@ -531,18 +487,18 @@ def main():
 
     class Embedder(nn.Module):
         def __init__(self, dict_size, embedding_size, hidden_size, output_size=768):
-            super(Embedder, self).__init__()
+            super().__init__()
 
             self.embedding = nn.Embedding(dict_size, embedding_size)
 
             self.mlp = nn.Sequential(
                 nn.Linear(embedding_size, hidden_size),
                 nn.SiLU(),
-                nn.Linear(hidden_size, output_size, bias=False),
+                nn.Linear(hidden_size, output_size, bias=False)
             )
 
-            # Initialize the weights of the second layer with zeros
-            nn.init.zeros_(self.mlp[-1].weight.data)
+            # Zero-initialize the last linear layer's weights
+            nn.init.zeros_(self.mlp[-1].weight)
 
         def forward(self, input_data):
             embedded = self.embedding(input_data)
@@ -593,18 +549,7 @@ def main():
                 args.learning_rate_lora * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
 
-    # Initialize the optimizer
-    if args.use_8bit_adam:
-        try:
-            import bitsandbytes as bnb
-        except ImportError:
-            raise ImportError(
-                "Please install bitsandbytes to use 8-bit Adam. You can do so by running `pip install bitsandbytes`"
-            )
-
-        optimizer_cls = bnb.optim.AdamW8bitve
-    else:
-        optimizer_cls = torch.optim.AdamW
+    optimizer_cls = torch.optim.AdamW
 
     optimizer_lora = optimizer_cls(
         lora_layers.parameters(),
@@ -622,84 +567,41 @@ def main():
         eps=args.adam_epsilon,
     )
 
-    print("Downloading dataset...")
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        print(args.dataset_name)
-        dataset = load_dataset(args.dataset_name, split='train')
+    print(f"Downloading dataset from {args.dataset_name}")
+    # Downloading and loading a dataset from the hub.
+    dataset = load_dataset(args.dataset_name, split='train')
 
-        empty_strings = ["" for _ in range(len(dataset))]
-        dataset = dataset.add_column("empty_prompt", empty_strings)
+    empty_strings = ["" for _ in range(len(dataset))]
+    dataset = dataset.add_column("empty_prompt", empty_strings)
 
-        if args.train_test_split == True:
+    if args.train_test_split == True:
+        dataset = dataset.train_test_split(0.1, seed=args.seed)
 
-            dataset = dataset.train_test_split(0.1, seed=0)
+        train_len = len(dataset['train'])
+        test_len = len(dataset['test'])
+        print(f'Split done, {train_len} samples in train and {test_len} in test')
+        print('Keeping train split ONLY')
+        dataset = dataset['train']
 
-            train_len = len(dataset['train'])
-            test_len = len(dataset['test'])
-            print(f'Split done, {train_len} samples in train and {test_len} in test')
-            print('Keeping train split ONLY')
-            dataset = dataset['train']
-
-        #print('Filtering Dataset')
-        #dataset = dataset.filter(
-        #   lambda example: not (example['proportion'] > 1.25 or example['proportion'] < 0.8)
-        #    # First question 'the floor is visible' or not
-        #)
-
-    else:
-        data_files = {}
-        if args.train_data_dir is not None:
-            data_files["train"] = os.path.join(args.train_data_dir, "**")
-        dataset = load_dataset(
-            "imagefolder",
-            data_files=data_files,
-            cache_dir=args.cache_dir,
-        )
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
+    if args.num_queries is None:
+        args.num_queries  = len(dataset[0][args.attributes_column])
 
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
     column_names = dataset.column_names
 
     # 6. Get the column names for input/target.
-    dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
-    if args.image_column is None:
-        image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
-    else:
-        image_column = args.image_column
-        if image_column not in column_names:
-            raise ValueError(
-                f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}"
-            )
-    if args.caption_column is None:
-        caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
-    else:
-        caption_column = args.caption_column
-        if caption_column not in column_names:
-            raise ValueError(
-                f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
-            )
-
-    # Preprocessing the datasets.
-    # We need to tokenize input captions and transform the images.
-    def tokenize_captions(examples, is_train=True):
-        captions = []
-        for caption in examples[caption_column]:
-            if isinstance(caption, str):
-                captions.append(caption)
-            elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
-                captions.append(random.choice(caption) if is_train else caption[0])
-            else:
-                raise ValueError(
-                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
-                )
-        inputs = tokenizer(
-            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+    image_column = args.image_column
+    if image_column not in column_names:
+        raise ValueError(
+            f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}"
         )
-        return inputs.input_ids
+
+    attributes_column = args.attributes_column
+    if attributes_column not in column_names:
+        raise ValueError(
+            f"--attributes_column' value '{args.attributes_column}' needs to be one of: {', '.join(column_names)}"
+        )
 
     class ResizeWithPadding:
         def __init__(self, size, interpolation=transforms.InterpolationMode.BILINEAR):
@@ -740,22 +642,17 @@ def main():
         embeddings_vector = embedder(binary_vector)
 
         empty_emb = torch.zeros([bs, 77 - len_question, 768]).to(
-            accelerator.device)  # enc for padding ---> 77 (will be masked)
-
-        # to mask the first token embedding, add substract to len_question *-1*
-        # zero_pos_emb = torch.zeros([bs, 1, 768]).to(accelerator.device)
-        # ehs = torch.cat((zero_pos_emb, embeddings_vector, empty_emb), dim=1)
+            accelerator.device)
 
         ehs = torch.cat((embeddings_vector, empty_emb), dim=1)
 
-        # ehs = torch.einsum('bht -> bth', ehs)
         return ehs.to(dtype=weight_dtype)
 
     def preprocess_train(examples):
         images = [image.convert("RGB") for image in examples[image_column]]
         examples["pixel_values"] = [train_transforms(image) for image in images]
 
-        examples["input_binary_vector"] = translate_to_dictionary(examples[caption_column])
+        examples["input_binary_vector"] = translate_to_dictionary(examples[attributes_column])
         return examples
 
     with accelerator.main_process_first():
@@ -941,10 +838,8 @@ def main():
                                                    uncond_embeddings[:, 1, :].unsqueeze(1).repeat(1, 76, 1)],
                                                   dim=1)
 
-                curriculum = 58
-
-                encoder_hidden_states[:, 1:curriculum + 1, :] = encoder_hidden_states[:, 1:curriculum + 1,
-                                                                :] + attribute_embeddings[:, 0:curriculum, :]
+                encoder_hidden_states[:, 1:args.num_queries + 1, :] = encoder_hidden_states[:, 1:args.num_queries + 1,
+                                                                :] + attribute_embeddings[:, 0:args.num_queries, :]
 
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
@@ -955,10 +850,10 @@ def main():
 
                 # Predict the noise residual and compute loss
                 encoder_attention_mask = torch.full([bsz, 77], True, dtype=torch.bool).to(accelerator.device)
-                encoder_attention_mask[:, curriculum + 1:] = False
+                encoder_attention_mask[:, args.num_queries + 1:] = False
 
                 where_null_mask = vector_nulls == 0
-                encoder_attention_mask[where_null_mask, 0:curriculum+1] = True
+                encoder_attention_mask[where_null_mask, 0:args.num_queries+1] = True
 
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states,
                                   encoder_attention_mask=encoder_attention_mask).sample
